@@ -715,7 +715,7 @@ async def on_startup(bot: Bot) -> None:
     webhook_url = f"{settings.render_external_url}/webhook"
     await bot.set_webhook(
         url=webhook_url,
-        drop_pending_updates=True,
+        allowed_updates=dispatcher.resolve_used_update_types(),
     )
     log.info("Webhook set to %s", webhook_url)
 
@@ -728,7 +728,7 @@ async def on_shutdown(bot: Bot) -> None:
     if monitor_task:
         await monitor_task
         
-    await bot.delete_webhook(drop_pending_updates=True)
+    # DO NOT delete webhook here, otherwise Render won't wake up on new messages
     await bot.session.close()
     db.close()
     
