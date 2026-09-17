@@ -267,7 +267,7 @@ async def ping(message: Message) -> None:
 
     reason = ""
     try:
-        await db.client.admin.command("ping")
+        db.client.admin.command("ping")
         mongo = "OK"
     except Exception as exc:
         mongo = "ERROR"
