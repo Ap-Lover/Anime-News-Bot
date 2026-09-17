@@ -317,7 +317,7 @@ class Monitor:
                     self._stop.wait(),
                     timeout=2,
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
             except asyncio.CancelledError:
                 raise

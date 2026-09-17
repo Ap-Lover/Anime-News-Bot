@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import re
-from collections.abc import Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from pathlib import Path
-from typing import Awaitable, TypeVar
+from typing import TypeVar
 
 from aiogram import Bot
 from aiogram.exceptions import (
