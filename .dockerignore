@@ -1,0 +1,33 @@
+# Secrets
+.env
+*.session
+*.session-journal
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# Git
+.git/
+.github/
+
+# Temporary downloads
+data/downloads/
+
+# Logs
+*.log
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Documentation (not needed at runtime)
+DEEP_AUDIT_REPORT.md
+PRD_AND_DEEP_AUDIT_PROMPT.md

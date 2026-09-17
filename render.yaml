@@ -1,0 +1,38 @@
+services:
+  - type: worker
+    name: instagram-telegram-bot
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    autoDeploy: true
+    envVars:
+      - key: TG_BOT_TOKEN
+        sync: false
+      - key: OWNER_ID
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: DATABASE_NAME
+        value: instagram_channel_bot
+      - key: POST_TIME_SECONDS
+        value: "1800"
+      - key: FETCH_LIMIT
+        value: "5"
+      - key: MONITOR_PROFILE_DELAY
+        value: "2"
+      - key: ALLPOST_ITEM_DELAY
+        value: "2"
+      - key: ALLPOST_BATCH_SIZE
+        value: "20"
+      - key: ALLPOST_BATCH_PAUSE
+        value: "10"
+      - key: TELEGRAM_UPLOAD_DELAY
+        value: "0.7"
+      - key: MAX_RETRIES
+        value: "3"
+      - key: ERROR_ALERT_COOLDOWN
+        value: "21600"
+      - key: DOWNLOADS_DIR
+        value: data/downloads
