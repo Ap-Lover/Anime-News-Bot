@@ -9,6 +9,8 @@ import re
 from aiogram import Bot, Dispatcher, Router
 from aiogram.filters import Command
 from aiogram.types import BotCommand, BotCommandScopeChat, Message
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from aiohttp import web
 
 from config import load_settings
 from database import Database
@@ -683,27 +685,83 @@ async def private_fallback(message: Message) -> None:
 
 
 # =============================================================================
-# 🏁 Entrypoint
+# 🏁 Entrypoint (Webhook Mode)
 # =============================================================================
 
 
-async def main() -> None:
-    """Start polling and gracefully shut down all resources."""
+monitor_task: asyncio.Task | None = None
 
+
+async def on_startup(bot: Bot) -> None:
+    """Start background tasks and set up the webhook."""
+    global monitor_task
+    
     await install_command_menu()
+    
     monitor_task = asyncio.create_task(
         monitor.run(),
         name="instagram-background-workers",
     )
+    
+    webhook_url = f"{settings.render_external_url}/webhook"
+    await bot.set_webhook(
+        url=webhook_url,
+        drop_pending_updates=True,
+    )
+    log.info("Webhook set to %s", webhook_url)
+
+
+async def on_shutdown(bot: Bot) -> None:
+    """Gracefully shut down all resources."""
+    log.info("Shutting down...")
+    
+    await monitor.stop()
+    if monitor_task:
+        await monitor_task
+        
+    await bot.delete_webhook(drop_pending_updates=True)
+    await bot.session.close()
+    db.close()
+    
+    log.info("Shutdown complete.")
+
+
+async def health_check(request: web.Request) -> web.Response:
+    """Render expects an HTTP 200 response to keep the service alive."""
+    return web.json_response({"status": "ok"})
+
+
+def main() -> None:
+    """Start the aiohttp server for Render Web Service."""
+    if not settings.render_external_url:
+        raise ValueError(
+            "RENDER_EXTERNAL_URL is missing. Please configure it in Render "
+            "(e.g. https://anime-news-bot.onrender.com) to use the webhook setup."
+        )
 
     try:
-        await dispatcher.start_polling(bot)
-    finally:
-        await monitor.stop()
-        await monitor_task
-        await bot.session.close()
-        db.close()
+        port = int(settings.port)
+    except ValueError as exc:
+        raise ValueError(f"Invalid PORT environment variable: {settings.port}") from exc
+
+    dispatcher.startup.register(on_startup)
+    dispatcher.shutdown.register(on_shutdown)
+
+    app = web.Application()
+
+    webhook_requests_handler = SimpleRequestHandler(
+        dispatcher=dispatcher,
+        bot=bot,
+    )
+    webhook_requests_handler.register(app, path="/webhook")
+
+    app.router.add_get("/health", health_check)
+
+    setup_application(app, dispatcher, bot=bot)
+
+    log.info("Starting web server on 0.0.0.0:%d", port)
+    web.run_app(app, host="0.0.0.0", port=port)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

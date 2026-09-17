@@ -43,12 +43,18 @@ OWNER_ID = int(os.environ.get("OWNER_ID", "0") or "0")
 # Optional extra admin IDs: 123456789,987654321
 _EXTRA_ADMIN_IDS = os.environ.get("ADMIN_IDS", "").strip()
 
-# Render/VPS port. The bot is a worker, so it normally does not need HTTP.
-PORT = os.environ.get("PORT", "8028").strip()
+# =============================================================================
+# 🚀 WEBHOOK - Render Service Settings
+# =============================================================================
+
+# Render/VPS port is now used for the aiohttp webhook server.
+PORT = os.environ.get("PORT", "10000").strip()
+
+RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
 
 
 # =============================================================================
-# 🍃 DATABASE — MongoDB
+# 🗄️ DATABASE — MongoDB
 # =============================================================================
 
 # Preferred variable: DATABASE_URL
@@ -192,6 +198,7 @@ class Settings:
     port: str
     app_id: int
     api_hash: str
+    render_external_url: str
 
 
 def _parse_admin_ids() -> frozenset[int]:
@@ -258,4 +265,5 @@ def load_settings() -> Settings:
         port=PORT,
         app_id=APP_ID,
         api_hash=API_HASH,
+        render_external_url=RENDER_EXTERNAL_URL,
     )
