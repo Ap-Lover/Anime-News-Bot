@@ -265,14 +265,23 @@ async def ping(message: Message) -> None:
     if not require_admin(message):
         return
 
+    reason = ""
     try:
         await db.client.admin.command("ping")
         mongo = "OK"
-    except Exception:
+    except Exception as exc:
         mongo = "ERROR"
+        # Sanitize any credentials in the error message (e.g. mongodb://user:pass@)
+        error_msg = re.sub(r"(://[^:]+:)[^@]+(@)", r"\1***\2", str(exc))
+        # Ensure we don't accidentally leak other secrets
+        if settings.bot_token in error_msg:
+            error_msg = error_msg.replace(settings.bot_token, "***")
+        if settings.mongodb_uri in error_msg:
+            error_msg = error_msg.replace(settings.mongodb_uri, "***")
+        reason = f"\nReason: {type(exc).__name__}: {error_msg[:200]}"
 
     await message.answer(
-        f"🏓 <b>Pong</b>\nMongoDB: <b>{mongo}</b>\n"
+        f"🏓 <b>Pong</b>\nMongoDB: <b>{mongo}</b>{reason}\n"
         f"Monitor: <b>{'ON' if db.is_monitor_enabled() else 'PAUSED'}</b>\n"
         f"Interval: <b>{format_duration(db.get_monitor_interval(settings.post_time_seconds))}</b>",
         parse_mode="HTML",
