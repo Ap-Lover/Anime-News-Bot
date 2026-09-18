@@ -319,16 +319,6 @@ async def add_insta(message: Message) -> None:
         mode = parse_mode(args[2] if len(args) >= 3 else None)
         label = " ".join(args[3:])[:80] if len(args) >= 4 else ""
 
-        # Validate profile and channel before writing the route to MongoDB.
-        async with monitor._ig_lock:
-            posts = await asyncio.to_thread(
-                instagram.latest_posts,
-                username,
-                1,
-            )
-        if not posts:
-            raise ValueError("Instagram profile has no readable posts")
-
         await ensure_channel_access(chat_id)
 
         added = db.add_feed(
@@ -345,22 +335,13 @@ async def add_insta(message: Message) -> None:
             )
             return
 
-        newest = posts[0]
-        db.mark_initial(
-            username,
-            chat_id,
-            newest.shortcode,
-            newest.date_utc.isoformat() if newest.date_utc else None,
-        )
-
         await message.answer(
             "✅ <b>Instagram route added</b>\n\n"
             f"Profile: <b>@{username}</b>\n"
             f"Channel: <code>{chat_id}</code>\n"
             f"Mode: <b>{mode.upper()}</b>\n"
             f"Label: <b>{label or 'none'}</b>\n"
-            f"Monitor: every <b>{format_duration(db.get_monitor_interval(settings.post_time_seconds))}</b>\n\n"
-            "The current newest item is marked as seen, so old content will not be reposted automatically.",
+            f"Monitor: every <b>{format_duration(db.get_monitor_interval(settings.post_time_seconds))}</b>",
             parse_mode="HTML",
         )
 
