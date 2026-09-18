@@ -527,15 +527,6 @@ async def allpost(message: Message) -> None:
         chat_id = parse_chat_id(args[1])
         mode = parse_mode(args[2] if len(args) == 3 else None, default="both")
 
-        async with monitor._ig_lock:
-            posts = await asyncio.to_thread(
-                instagram.latest_posts,
-                username,
-                1,
-            )
-        if not posts:
-            raise ValueError("Instagram profile has no readable posts")
-
         await ensure_channel_access(chat_id)
 
         job_id = db.create_allpost_job(
