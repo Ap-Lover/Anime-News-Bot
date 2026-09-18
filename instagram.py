@@ -367,7 +367,6 @@ class InstagramClient:
             ),
         )
 
-        loader.context._session = self.session
         loader.context.user_agent = self.active_user_agent
 
         if self._login_username or self._session_file:
@@ -386,6 +385,9 @@ class InstagramClient:
                 self._login_username,
                 str(session_path),
             )
+
+        if self.proxies:
+            loader.context._session.proxies.update(self.proxies)
 
         return loader
 
