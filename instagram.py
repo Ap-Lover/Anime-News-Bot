@@ -362,6 +362,11 @@ class InstagramClient:
                 )
             except InstagramHTTPError as exc:
                 log.info("Falling back to Instaloader for @%s: %s", username, exc)
+                return self._instaloader_latest_posts(
+                    username,
+                    limit,
+                    fast_fail=True,
+                )
 
         return self._instaloader_latest_posts(username, limit)
 
@@ -391,6 +396,8 @@ class InstagramClient:
                 return
             except InstagramHTTPError as exc:
                 log.info("Falling back to Instaloader for @%s: %s", username, exc)
+                yield from self._iter_instaloader_posts(username, fast_fail=True)
+                return
             else:
                 for post in public_posts:
                     yielded.add(post.shortcode)
