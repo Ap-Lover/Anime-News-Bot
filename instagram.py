@@ -57,6 +57,11 @@ USER_AGENT = (
 )
 
 PROFILE_URL_TEMPLATE = "https://www.instagram.com/{0}/"
+API_V1_FEED_URL = "https://www.instagram.com/api/v1/feed/user/{user_id}/"
+API_V1_WEB_PROFILE_URL = (
+    "https://www.instagram.com/api/v1/users/web_profile_info/"
+)
+IG_APP_ID = "936619743392459"
 
 REQUEST_TIMEOUT = 15.0
 
@@ -115,6 +120,12 @@ _CAPTION_OBJECT_RE = re.compile(
     r'"caption"\s*:\s*\{\s*"text"\s*:\s*"(?P<value>(?:[^"\\]|\\.)*)"'
 )
 _CAPTION_STRING_RE = re.compile(r'"caption"\s*:\s*"(?P<value>(?:[^"\\]|\\.)*)"')
+
+# User-ID extraction patterns for the canonical profile page HTML.
+_PROFILE_PAGE_ID_RE = re.compile(r'"profilePage_(\d+)"')
+_USER_ID_RE = re.compile(r'"user_id"\s*:\s*"(\d+)"')
+_PK_RE = re.compile(r'"pk"\s*:\s*"?(\d+)"?')
+_LOGGING_PAGE_ID_RE = re.compile(r'"logging_page_id"\s*:\s*"profilePage_(\d+)"')
 
 _EPOCH_UTC = datetime.min.replace(tzinfo=UTC)
 
@@ -344,7 +355,8 @@ class InstagramClient:
 
         self._login_username = login_username
         self._session_file = session_file
-        self._fast_loader: instaloader.Instaloader | None = None
+        self._user_id_cache: dict[str, str] = {}
+        self._api_session: requests.Session | None = None
 
         self.loader = self._build_loader()
 
@@ -391,82 +403,432 @@ class InstagramClient:
 
         return loader
 
-    def _failure_loader(self) -> instaloader.Instaloader:
-        """Return the fast-fail Instaloader used for fallback fetches."""
+    # =========================================================================
+    # 🆔 User-ID resolution (independent of Instaloader)
+    # =========================================================================
 
-        if self._fast_loader is None:
-            self._fast_loader = self._build_loader(fast_fail=True)
-        return self._fast_loader
+    @staticmethod
+    def _extract_user_id_from_html(html: str) -> str | None:
+        """Extract the numeric Instagram user ID from profile page HTML.
 
-    def latest_posts(self, username: str, limit: int = 5):
-        """Return only a small recent window for normal monitoring.
-
-        The canonical public profile URL is tried first. The previous
-        Instaloader implementation is used whenever the public page does not
-        expose enough post data.
+        Instagram embeds the ID in several JSON patterns inside the HTML.
+        We try multiple patterns and return the first match.
         """
 
+        for pattern in (_PROFILE_PAGE_ID_RE, _LOGGING_PAGE_ID_RE, _USER_ID_RE, _PK_RE):
+            match = pattern.search(html)
+            if match:
+                value = match.group(1)
+                # Sanity-check: must be a plausible Instagram numeric ID.
+                if value.isdigit() and len(value) >= 5:
+                    return value
+        return None
+
+    def _resolve_user_id(self, username: str) -> str:
+        """Resolve an Instagram username to a numeric user ID.
+
+        1. Return cached value if available.
+        2. Fetch the public profile HTML and extract the ID from embedded JSON.
+        3. If the HTML does not expose the ID, call the web_profile_info API.
+
+        Does NOT use ``instaloader.Profile.from_username()``.
+
+        Raises :class:`InstagramHTTPError` when resolution fails.
+        """
+
+        cached = self._user_id_cache.get(username)
+        if cached:
+            return cached
+
+        # --- Step 1: try to extract from the public profile HTML ---
+        try:
+            html = self._get_profile_page(username)
+            user_id = self._extract_user_id_from_html(html)
+            if user_id:
+                self._user_id_cache[username] = user_id
+                log.debug("Resolved @%s -> %s from profile HTML", username, user_id)
+                return user_id
+        except InstagramHTTPError:
+            # Profile page failed; try the API fallback below.
+            pass
+
+        # --- Step 2: web_profile_info API fallback ---
+        api_session = self._get_api_session()
+        try:
+            resp = api_session.get(
+                API_V1_WEB_PROFILE_URL,
+                params={"username": username},
+                timeout=REQUEST_TIMEOUT,
+            )
+        except Exception as exc:
+            if self._is_network_error(exc):
+                raise InstagramHTTPError(
+                    f"web_profile_info request failed for @{username}: {exc}",
+                    transient=True,
+                ) from exc
+            raise
+
+        if resp.status_code == 429:
+            raise InstagramRateLimited(
+                f"Rate limited resolving user ID for @{username}"
+            )
+        if resp.status_code != 200:
+            raise InstagramHTTPError(
+                f"web_profile_info returned HTTP {resp.status_code} for @{username}",
+                status_code=resp.status_code,
+                transient=resp.status_code >= 500,
+            )
+
+        try:
+            data = resp.json()
+            user_obj = data["data"]["user"]
+            user_id = str(user_obj["id"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise InstagramHTTPError(
+                f"Could not parse user ID from web_profile_info for @{username}",
+            ) from exc
+
+        self._user_id_cache[username] = user_id
+        log.debug("Resolved @%s -> %s from web_profile_info", username, user_id)
+        return user_id
+
+    # =========================================================================
+    # 📡 API v1 feed fetcher
+    # =========================================================================
+
+    def _get_api_session(self) -> requests.Session:
+        """Return a plain ``requests.Session`` for API v1 calls.
+
+        This is **not** a curl_cffi session and is never assigned to
+        ``loader.context._session``.  It copies cookies from the Instaloader
+        authenticated session (if available) so the requests are authenticated.
+        """
+
+        if self._api_session is not None:
+            return self._api_session
+
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": self.active_user_agent,
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.instagram.com/",
+            "X-IG-App-ID": IG_APP_ID,
+            "X-Requested-With": "XMLHttpRequest",
+        })
+
+        if self.proxies:
+            session.proxies.update(self.proxies)
+
+        # Copy authentication cookies from the Instaloader session.
+        try:
+            loader_session = self.loader.context._session
+            if loader_session and hasattr(loader_session, "cookies"):
+                session.cookies.update(loader_session.cookies)
+        except Exception:
+            pass
+
+        self._api_session = session
+        return session
+
+    @staticmethod
+    def _media_item_to_post(item: dict) -> PublicPost | None:
+        """Convert one API v1 media item dict into a :class:`PublicPost`."""
+
+        shortcode = item.get("code") or ""
+        if not shortcode:
+            return None
+
+        # Caption
+        caption = ""
+        caption_obj = item.get("caption")
+        if isinstance(caption_obj, dict):
+            caption = caption_obj.get("text") or ""
+        elif isinstance(caption_obj, str):
+            caption = caption_obj
+
+        # Timestamp
+        date_utc = None
+        taken_at = item.get("taken_at")
+        if isinstance(taken_at, (int, float)):
+            date_utc = datetime.fromtimestamp(int(taken_at), tz=UTC)
+
+        # Post / reel classification
+        product_type = str(item.get("product_type") or "").lower()
+        kind = "reel" if product_type in {"clips", "reels", "reel"} else "post"
+
+        # Video detection
+        media_type = item.get("media_type")  # 1=image, 2=video, 8=carousel
+        is_video = media_type == 2 or bool(item.get("video_versions"))
+
+        # Carousel detection
+        carousel_media = item.get("carousel_media")
+        is_carousel = media_type == 8 or isinstance(carousel_media, list)
+
+        # --- Media URL extraction ---
+        media_urls: list[str] = []
+        thumbnail_url: str | None = None
+
+        def _best_image(node: dict) -> str | None:
+            iv2 = node.get("image_versions2")
+            if isinstance(iv2, dict):
+                candidates = iv2.get("candidates")
+                if isinstance(candidates, list) and candidates:
+                    return candidates[0].get("url")
+            return None
+
+        def _best_video(node: dict) -> str | None:
+            vv = node.get("video_versions")
+            if isinstance(vv, list) and vv:
+                return vv[0].get("url")
+            return None
+
+        if is_carousel and isinstance(carousel_media, list):
+            for child in carousel_media:
+                child_type = child.get("media_type")
+                if child_type == 2 or child.get("video_versions"):
+                    url = _best_video(child) or _best_image(child)
+                else:
+                    url = _best_image(child)
+                if url:
+                    media_urls.append(url)
+            # Thumbnail from the parent item.
+            thumbnail_url = _best_image(item)
+        elif is_video:
+            url = _best_video(item)
+            if url:
+                media_urls.append(url)
+            thumbnail_url = _best_image(item)
+        else:
+            url = _best_image(item)
+            if url:
+                media_urls.append(url)
+                thumbnail_url = url
+
+        if not media_urls and not thumbnail_url:
+            return None
+
+        return PublicPost(
+            shortcode=shortcode,
+            caption=caption,
+            date_utc=date_utc,
+            kind=kind,
+            is_video=is_video,
+            is_carousel=is_carousel,
+            media_urls=media_urls,
+            thumbnail_url=thumbnail_url,
+        )
+
+    def _fetch_api_v1_feed(
+        self,
+        user_id: str,
+        limit: int = PROFILE_FETCH_LIMIT,
+    ) -> list[PublicPost]:
+        """Fetch recent posts via the API v1 user feed endpoint.
+
+        Uses ``next_max_id`` pagination. Stops when ``more_available`` is false,
+        ``next_max_id`` is absent, or *limit* posts have been collected.
+
+        Raises :class:`InstagramRateLimited` on HTTP 429 (no proxy rotation).
+        Raises :class:`InstagramHTTPError` on other HTTP errors.
+        """
+
+        api_session = self._get_api_session()
+        url = API_V1_FEED_URL.format(user_id=user_id)
+        posts: list[PublicPost] = []
+        params: dict[str, str | int] = {"count": 12}
+        max_pages = (limit // 12) + 2  # safety cap
+
+        for _page in range(max_pages):
+            try:
+                resp = api_session.get(url, params=params, timeout=REQUEST_TIMEOUT)
+            except Exception as exc:
+                if self._is_network_error(exc):
+                    raise InstagramHTTPError(
+                        f"API v1 feed request failed: {exc}",
+                        transient=True,
+                    ) from exc
+                raise
+
+            if resp.status_code == 429:
+                raise InstagramRateLimited(
+                    "Instagram rate limited the API v1 feed request."
+                )
+            if resp.status_code != 200:
+                raise InstagramHTTPError(
+                    f"API v1 feed returned HTTP {resp.status_code}",
+                    status_code=resp.status_code,
+                    transient=resp.status_code >= 500,
+                )
+
+            try:
+                data = resp.json()
+            except (ValueError, TypeError) as exc:
+                raise InstagramHTTPError(
+                    "API v1 feed returned non-JSON response.",
+                ) from exc
+
+            items = data.get("items") or []
+            for item in items:
+                post = self._media_item_to_post(item)
+                if post is not None:
+                    posts.append(post)
+                if len(posts) >= limit:
+                    break
+
+            if len(posts) >= limit:
+                break
+
+            more_available = data.get("more_available", False)
+            next_max_id = data.get("next_max_id")
+            if not more_available or not next_max_id:
+                break
+
+            params["max_id"] = next_max_id
+
+        return posts[:limit]
+
+    # =========================================================================
+    # 📬 Main post-fetching interface
+    # =========================================================================
+
+    def latest_posts(self, username: str, limit: int = 5):
+        """Return a small recent window for normal monitoring.
+
+        Preferred path: API v1 feed (avoids broken Instaloader GraphQL).
+        Fallback:       public profile HTML scraping.
+        """
+
+        # --- Primary: API v1 feed ---
+        try:
+            user_id = self._resolve_user_id(username)
+            posts = self._fetch_api_v1_feed(user_id, limit)
+            if posts:
+                return posts
+            log.info("API v1 feed returned no items for @%s; trying HTML.", username)
+        except InstagramRateLimited:
+            raise  # let the monitor handle 429
+        except InstagramHTTPError as exc:
+            log.info(
+                "API v1 feed unavailable for @%s (%s); trying HTML.",
+                username,
+                exc,
+            )
+        except Exception as exc:
+            log.warning(
+                "Unexpected error in API v1 path for @%s: %s",
+                username,
+                exc,
+            )
+
+        # --- Fallback: public profile HTML ---
         if self.use_public_profile_fetch:
             try:
                 return self.fetch_public_posts(username, limit)
-            except InstagramRateLimited as exc:
-                log.warning(
-                    "Public profile page rate limited for @%s: %s",
+            except InstagramRateLimited:
+                raise
+            except InstagramHTTPError as exc:
+                log.info(
+                    "Public HTML also failed for @%s: %s",
                     username,
                     exc,
                 )
-                return self._instaloader_latest_posts(
-                    username,
-                    limit,
-                    fast_fail=True,
-                )
-            except InstagramHTTPError as exc:
-                log.info("Falling back to Instaloader for @%s: %s", username, exc)
-                return self._instaloader_latest_posts(
-                    username,
-                    limit,
-                    fast_fail=True,
-                )
 
-        return self._instaloader_latest_posts(username, limit)
+        raise InstagramHTTPError(
+            f"All fetch methods failed for @{username}",
+            transient=True,
+        )
 
     def iter_posts(self, username: str):
-        """Stream posts newest → oldest without storing the whole profile.
+        """Stream posts newest → oldest for ``/allpost``.
 
-        Posts found through the public profile URL are yielded first, then the
-        Instaloader implementation continues the stream so ``/allpost`` keeps
-        its ordering and resume behaviour. Duplicate shortcodes are skipped.
+        Uses API v1 feed pagination as the primary path. Falls back to public
+        profile HTML if user-ID resolution fails. Duplicate shortcodes are
+        skipped.
         """
 
         yielded: set[str] = set()
 
+        # --- Try API v1 paginated feed ---
+        try:
+            user_id = self._resolve_user_id(username)
+        except (InstagramHTTPError, Exception) as exc:
+            log.info(
+                "Cannot resolve user ID for @%s (%s); falling back to HTML.",
+                username,
+                exc,
+            )
+            user_id = None
+
+        if user_id is not None:
+            api_session = self._get_api_session()
+            url = API_V1_FEED_URL.format(user_id=user_id)
+            params: dict[str, str | int] = {"count": 12}
+            max_pages = 500  # safety cap for very large profiles
+
+            for _page in range(max_pages):
+                try:
+                    resp = api_session.get(
+                        url, params=params, timeout=REQUEST_TIMEOUT,
+                    )
+                except Exception as exc:
+                    if self._is_network_error(exc):
+                        log.warning(
+                            "API v1 pagination transport error for @%s: %s",
+                            username,
+                            exc,
+                        )
+                    break
+
+                if resp.status_code == 429:
+                    log.warning(
+                        "API v1 feed rate limited during pagination for @%s",
+                        username,
+                    )
+                    break
+                if resp.status_code != 200:
+                    log.warning(
+                        "API v1 feed returned HTTP %d during pagination for @%s",
+                        resp.status_code,
+                        username,
+                    )
+                    break
+
+                try:
+                    data = resp.json()
+                except (ValueError, TypeError):
+                    break
+
+                items = data.get("items") or []
+                for item in items:
+                    post = self._media_item_to_post(item)
+                    if post is not None and post.shortcode not in yielded:
+                        yielded.add(post.shortcode)
+                        yield post
+
+                more_available = data.get("more_available", False)
+                next_max_id = data.get("next_max_id")
+                if not more_available or not next_max_id:
+                    return  # exhausted the feed
+
+                params["max_id"] = next_max_id
+
+            return  # finished API v1 pagination
+
+        # --- Fallback: public profile HTML (limited window) ---
         if self.use_public_profile_fetch:
             try:
-                public_posts = self.fetch_public_posts(
-                    username,
-                    PROFILE_FETCH_LIMIT,
+                html_posts = self.fetch_public_posts(
+                    username, PROFILE_FETCH_LIMIT,
                 )
-            except InstagramRateLimited as exc:
-                log.warning(
-                    "Public profile page rate limited for @%s: %s",
-                    username,
-                    exc,
-                )
-                yield from self._iter_instaloader_posts(username, fast_fail=True)
-                return
+                for post in html_posts:
+                    if post.shortcode not in yielded:
+                        yielded.add(post.shortcode)
+                        yield post
             except InstagramHTTPError as exc:
-                log.info("Falling back to Instaloader for @%s: %s", username, exc)
-                yield from self._iter_instaloader_posts(username, fast_fail=True)
-                return
-            else:
-                for post in public_posts:
-                    yielded.add(post.shortcode)
-                    yield post
-
-        for post in self._iter_instaloader_posts(username):
-            if post.shortcode in yielded:
-                continue
-            yield post
+                log.warning(
+                    "Public HTML also failed for @%s: %s", username, exc,
+                )
 
     @staticmethod
     def post_kind(post) -> str:
@@ -983,36 +1345,6 @@ class InstagramClient:
             ),
             files=downloaded.files,
         )
-
-    # =========================================================================
-    # 🧯 Instaloader fallback
-    # =========================================================================
-
-    def _instaloader_latest_posts(
-        self,
-        username: str,
-        limit: int = 5,
-        *,
-        fast_fail: bool = False,
-    ):
-        """Return the small recent window straight from Instaloader."""
-
-        loader = self._failure_loader() if fast_fail else self.loader
-        profile = instaloader.Profile.from_username(loader.context, username)
-
-        posts = []
-        for post in profile.get_posts():
-            posts.append(post)
-            if len(posts) >= limit:
-                break
-        return posts
-
-    def _iter_instaloader_posts(self, username: str, *, fast_fail: bool = False):
-        """Stream Instaloader posts newest → oldest."""
-
-        loader = self._failure_loader() if fast_fail else self.loader
-        profile = instaloader.Profile.from_username(loader.context, username)
-        yield from profile.get_posts()
 
     @staticmethod
     def cleanup_files(files: list[Path]) -> None:
