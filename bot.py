@@ -38,6 +38,9 @@ instagram = InstagramClient(
     settings.downloads_dir,
     login_username=settings.ig_login_username,
     session_file=settings.ig_session_file,
+    proxy_enabled=settings.proxy_enabled,
+    proxy_url=settings.proxy_url,
+    proxy_fallback_url=settings.proxy_fallback_url,
 )
 bot = Bot(settings.bot_token)
 dispatcher = Dispatcher()

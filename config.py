@@ -171,6 +171,15 @@ IG_SESSION_FILE = os.environ.get("IG_SESSION_FILE", "").strip()
 
 
 # =============================================================================
+# 🌐 PROXY SETTINGS
+# =============================================================================
+
+PROXY_ENABLED = os.environ.get("PROXY_ENABLED", "false").strip().lower() == "true"
+PROXY_URL = os.environ.get("PROXY_URL", "").strip()
+PROXY_FALLBACK_URL = os.environ.get("PROXY_FALLBACK_URL", "").strip()
+
+
+# =============================================================================
 # 🧩 Runtime settings object
 # =============================================================================
 
@@ -187,6 +196,9 @@ class Settings:
     downloads_dir: str
     ig_login_username: str
     ig_session_file: str
+    proxy_enabled: bool
+    proxy_url: str
+    proxy_fallback_url: str
     fetch_limit: int
     monitor_profile_delay: float
     allpost_item_delay: float
@@ -254,6 +266,9 @@ def load_settings() -> Settings:
         downloads_dir=DOWNLOADS_DIR,
         ig_login_username=IG_LOGIN_USERNAME,
         ig_session_file=IG_SESSION_FILE,
+        proxy_enabled=PROXY_ENABLED,
+        proxy_url=PROXY_URL,
+        proxy_fallback_url=PROXY_FALLBACK_URL,
         fetch_limit=FETCH_LIMIT,
         monitor_profile_delay=MONITOR_PROFILE_DELAY,
         allpost_item_delay=ALLPOST_ITEM_DELAY,

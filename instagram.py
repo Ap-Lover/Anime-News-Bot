@@ -36,6 +36,13 @@ try:  # BeautifulSoup is optional; raw HTML/JSON parsing covers the rest.
 except ModuleNotFoundError:  # pragma: no cover - optional dependency
     BeautifulSoup = None
 
+try:
+    from curl_cffi import requests as c_requests
+    from curl_cffi.requests.exceptions import RequestException as C_RequestException
+except ModuleNotFoundError:
+    c_requests = None
+    C_RequestException = None
+
 log = logging.getLogger(__name__)
 
 
@@ -276,16 +283,31 @@ class InstagramClient:
         login_username: str = "",
         session_file: str = "",
         use_public_profile_fetch: bool = True,
+        proxy_enabled: bool = False,
+        proxy_url: str = "",
+        proxy_fallback_url: str = "",
     ) -> None:
         self.downloads_dir = Path(downloads_dir)
         self.downloads_dir.mkdir(parents=True, exist_ok=True)
 
         self.use_public_profile_fetch = use_public_profile_fetch
 
-        # One shared session keeps the normal browser headers and connection
-        # pool for every public profile request.
-        self.session = requests.Session()
+        self.proxies = None
+        self.fallback_proxies = None
+        if proxy_enabled:
+            if proxy_url:
+                self.proxies = {"http": proxy_url, "https": proxy_url}
+            if proxy_fallback_url:
+                self.fallback_proxies = {"http": proxy_fallback_url, "https": proxy_fallback_url}
+
+        if c_requests is not None:
+            self.session = c_requests.Session(impersonate="chrome")
+        else:
+            self.session = requests.Session()
+
         self.session.headers.update(BROWSER_HEADERS)
+        if self.proxies:
+            self.session.proxies.update(self.proxies)
 
         self._login_username = login_username
         self._session_file = session_file
@@ -328,6 +350,9 @@ class InstagramClient:
                 self._login_username,
                 str(session_path),
             )
+
+        if self.proxies:
+            loader.context._session.proxies.update(self.proxies)
 
         return loader
 
@@ -432,7 +457,7 @@ class InstagramClient:
         if isinstance(exc, InstagramHTTPError):
             return exc.transient or exc.status_code == 429
 
-        return isinstance(
+        is_transient = isinstance(
             exc,
             (
                 TooManyRequestsException,
@@ -441,6 +466,10 @@ class InstagramClient:
                 requests.RequestException,
             ),
         )
+        if C_RequestException is not None and isinstance(exc, C_RequestException):
+            is_transient = True
+            
+        return is_transient
 
     @staticmethod
     def is_access_error(exc: Exception) -> bool:
@@ -550,6 +579,15 @@ class InstagramClient:
 
         return posts[:limit] if limit else posts
 
+    @staticmethod
+    def _is_network_error(exc: Exception) -> bool:
+        """Return True for genuine connection/transport exceptions."""
+        if isinstance(exc, requests.RequestException):
+            return True
+        if C_RequestException is not None and isinstance(exc, C_RequestException):
+            return True
+        return False
+
     def _get_profile_page(self, username: str) -> str:
         """GET the canonical profile URL once, with a finite timeout."""
 
@@ -557,16 +595,25 @@ class InstagramClient:
 
         try:
             response = self.session.get(url, timeout=REQUEST_TIMEOUT)
-        except requests.Timeout as exc:
-            raise InstagramHTTPError(
-                f"Instagram profile request timed out after {REQUEST_TIMEOUT}s: {url}",
-                transient=True,
-            ) from exc
-        except requests.RequestException as exc:
-            raise InstagramHTTPError(
-                f"Instagram profile request failed: {exc}",
-                transient=True,
-            ) from exc
+        except Exception as exc:
+            if self._is_network_error(exc) and self.fallback_proxies:
+                log.info("Connection failed for @%s, trying slow proxy failover", username)
+                import time
+                time.sleep(2.0)
+                try:
+                    response = self.session.get(url, timeout=REQUEST_TIMEOUT, proxies=self.fallback_proxies)
+                except Exception as exc2:
+                    raise InstagramHTTPError(
+                        f"Instagram profile request failed (after failover): {exc2}",
+                        transient=True,
+                    ) from exc2
+            elif self._is_network_error(exc):
+                raise InstagramHTTPError(
+                    f"Instagram profile request failed: {exc}",
+                    transient=True,
+                ) from exc
+            else:
+                raise
 
         if response.status_code == 429:
             raise InstagramRateLimited(
@@ -817,11 +864,25 @@ class InstagramClient:
                     timeout=REQUEST_TIMEOUT,
                     stream=True,
                 )
-            except requests.RequestException as exc:
-                raise InstagramHTTPError(
-                    f"Media download failed: {exc}",
-                    transient=True,
-                ) from exc
+            except Exception as exc:
+                if self._is_network_error(exc) and self.fallback_proxies:
+                    log.info("Media download connection failed, trying slow proxy failover")
+                    import time
+                    time.sleep(2.0)
+                    try:
+                        response = self.session.get(url, timeout=REQUEST_TIMEOUT, stream=True, proxies=self.fallback_proxies)
+                    except Exception as exc2:
+                        raise InstagramHTTPError(
+                            f"Media download failed (after failover): {exc2}",
+                            transient=True,
+                        ) from exc2
+                elif self._is_network_error(exc):
+                    raise InstagramHTTPError(
+                        f"Media download failed: {exc}",
+                        transient=True,
+                    ) from exc
+                else:
+                    raise
 
             with response:
                 if response.status_code == 429:
