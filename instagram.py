@@ -271,6 +271,32 @@ class _NoWaitRateController(instaloader.RateController):
         )
 
 
+BaseSession = c_requests.Session if c_requests is not None else requests.Session
+
+class InstagramSession(BaseSession):
+    """HTTP Session that supports optional slow proxy failover for transport errors."""
+
+    def __init__(self, fallback_proxies: dict[str, str] | None = None, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fallback_proxies = fallback_proxies
+
+    def request(self, method, url, **kwargs):
+        try:
+            return super().request(method, url, **kwargs)
+        except Exception as exc:
+            is_network = isinstance(exc, requests.RequestException)
+            if C_RequestException is not None and isinstance(exc, C_RequestException):
+                is_network = True
+
+            if is_network and self.fallback_proxies:
+                log.info("Connection failed for %s, trying slow proxy failover", url)
+                import time
+                time.sleep(2.0)
+                kwargs["proxies"] = self.fallback_proxies
+                return super().request(method, url, **kwargs)
+            raise
+
+
 class InstagramClient:
     """Public profile page client with an Instaloader fallback."""
 
@@ -301,11 +327,18 @@ class InstagramClient:
                 self.fallback_proxies = {"http": proxy_fallback_url, "https": proxy_fallback_url}
 
         if c_requests is not None:
-            self.session = c_requests.Session(impersonate="chrome")
+            self.session = InstagramSession(
+                fallback_proxies=self.fallback_proxies, impersonate="chrome"
+            )
         else:
-            self.session = requests.Session()
+            self.session = InstagramSession(fallback_proxies=self.fallback_proxies)
 
-        self.session.headers.update(BROWSER_HEADERS)
+        self.active_user_agent = self.session.headers.get("User-Agent") or USER_AGENT
+        
+        headers = BROWSER_HEADERS.copy()
+        headers["User-Agent"] = self.active_user_agent
+        self.session.headers.update(headers)
+        
         if self.proxies:
             self.session.proxies.update(self.proxies)
 
@@ -334,6 +367,9 @@ class InstagramClient:
             ),
         )
 
+        loader.context._session = self.session
+        loader.context.user_agent = self.active_user_agent
+
         if self._login_username or self._session_file:
             if not self._login_username or not self._session_file:
                 raise RuntimeError(
@@ -350,9 +386,6 @@ class InstagramClient:
                 self._login_username,
                 str(session_path),
             )
-
-        if self.proxies:
-            loader.context._session.proxies.update(self.proxies)
 
         return loader
 
@@ -596,24 +629,12 @@ class InstagramClient:
         try:
             response = self.session.get(url, timeout=REQUEST_TIMEOUT)
         except Exception as exc:
-            if self._is_network_error(exc) and self.fallback_proxies:
-                log.info("Connection failed for @%s, trying slow proxy failover", username)
-                import time
-                time.sleep(2.0)
-                try:
-                    response = self.session.get(url, timeout=REQUEST_TIMEOUT, proxies=self.fallback_proxies)
-                except Exception as exc2:
-                    raise InstagramHTTPError(
-                        f"Instagram profile request failed (after failover): {exc2}",
-                        transient=True,
-                    ) from exc2
-            elif self._is_network_error(exc):
+            if self._is_network_error(exc):
                 raise InstagramHTTPError(
                     f"Instagram profile request failed: {exc}",
                     transient=True,
                 ) from exc
-            else:
-                raise
+            raise
 
         if response.status_code == 429:
             raise InstagramRateLimited(
@@ -865,24 +886,12 @@ class InstagramClient:
                     stream=True,
                 )
             except Exception as exc:
-                if self._is_network_error(exc) and self.fallback_proxies:
-                    log.info("Media download connection failed, trying slow proxy failover")
-                    import time
-                    time.sleep(2.0)
-                    try:
-                        response = self.session.get(url, timeout=REQUEST_TIMEOUT, stream=True, proxies=self.fallback_proxies)
-                    except Exception as exc2:
-                        raise InstagramHTTPError(
-                            f"Media download failed (after failover): {exc2}",
-                            transient=True,
-                        ) from exc2
-                elif self._is_network_error(exc):
+                if self._is_network_error(exc):
                     raise InstagramHTTPError(
                         f"Media download failed: {exc}",
                         transient=True,
                     ) from exc
-                else:
-                    raise
+                raise
 
             with response:
                 if response.status_code == 429:
