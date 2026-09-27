@@ -46,6 +46,7 @@ class Database:
         self.deliveries = self.db["deliveries"]
         self.jobs = self.db["jobs"]
         self.settings = self.db["settings"]
+        self.user_ids = self.db["user_ids"]
 
         self._create_indexes()
 
@@ -73,6 +74,11 @@ class Database:
         self.jobs.create_index(
             [("created_at", DESCENDING)],
             name="job_created_desc",
+        )
+        self.user_ids.create_index(
+            "username",
+            unique=True,
+            name="username_unique",
         )
 
     def close(self) -> None:
@@ -232,7 +238,11 @@ class Database:
         last_alert = feed.get("last_alert_at")
 
         if previous_error != normalized_error:
-            return True
+            rate_limit_keywords = ("InstagramRateLimited", "TooManyRequestsException", "rate limited", "429")
+            is_rate_limit = any(k in normalized_error for k in rate_limit_keywords)
+            was_rate_limit = previous_error and any(k in previous_error for k in rate_limit_keywords)
+            if not (is_rate_limit and was_rate_limit):
+                return True
 
         return not last_alert or (
             now - last_alert
@@ -293,6 +303,33 @@ class Database:
             },
             {
                 "$set": {"kind": kind, "sent_at": now},
+                "$setOnInsert": {"created_at": now},
+            },
+            upsert=True,
+        )
+
+    # =========================================================================
+    # 🆔 User ID cache
+    # =========================================================================
+
+    def get_user_id(self, username: str) -> str | None:
+        """Read a cached Instagram numeric user ID from MongoDB."""
+
+        doc = self.user_ids.find_one({"username": username.lower()})
+        return doc.get("user_id") if doc else None
+
+    def save_user_id(self, username: str, user_id: str) -> None:
+        """Persist a resolved Instagram numeric user ID to MongoDB."""
+
+        now = utc_now()
+        self.user_ids.update_one(
+            {"username": username.lower()},
+            {
+                "$set": {
+                    "username": username.lower(),
+                    "user_id": str(user_id),
+                    "updated_at": now,
+                },
                 "$setOnInsert": {"created_at": now},
             },
             upsert=True,
