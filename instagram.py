@@ -126,6 +126,11 @@ _PROFILE_PAGE_ID_RE = re.compile(r'"profilePage_(\d+)"')
 _USER_ID_RE = re.compile(r'"user_id"\s*:\s*"(\d+)"')
 _PK_RE = re.compile(r'"pk"\s*:\s*"?(\d+)"?')
 _LOGGING_PAGE_ID_RE = re.compile(r'"logging_page_id"\s*:\s*"profilePage_(\d+)"')
+_META_OWNER_ID_RE = re.compile(r'<meta\s+property="instapp:owner_id"\s+content="(\d+)"', re.IGNORECASE)
+_META_AL_IOS_RE = re.compile(r'<meta\s+property="al:ios:url"\s+content="instagram://user\?username=[^"&]*&amp;id=(\d+)"', re.IGNORECASE)
+_META_AL_ANDROID_RE = re.compile(r'<meta\s+property="al:android:url"\s+content="https?://instagram\.com/_u/[^/]+/\?id=(\d+)"', re.IGNORECASE)
+_TARGET_ID_RE = re.compile(r'"target_id"\s*:\s*"(\d+)"')
+_OWNER_ID_JSON_RE = re.compile(r'"owner_id"\s*:\s*"(\d+)"')
 
 _EPOCH_UTC = datetime.min.replace(tzinfo=UTC)
 
@@ -323,11 +328,15 @@ class InstagramClient:
         proxy_enabled: bool = False,
         proxy_url: str = "",
         proxy_fallback_url: str = "",
+        get_user_id_fn: callable | None = None,
+        save_user_id_fn: callable | None = None,
     ) -> None:
         self.downloads_dir = Path(downloads_dir)
         self.downloads_dir.mkdir(parents=True, exist_ok=True)
 
         self.use_public_profile_fetch = use_public_profile_fetch
+        self._get_user_id_fn = get_user_id_fn
+        self._save_user_id_fn = save_user_id_fn
 
         self.proxies = None
         self.fallback_proxies = None
@@ -411,11 +420,21 @@ class InstagramClient:
     def _extract_user_id_from_html(html: str) -> str | None:
         """Extract the numeric Instagram user ID from profile page HTML.
 
-        Instagram embeds the ID in several JSON patterns inside the HTML.
+        Instagram embeds the ID in meta tags and several JSON patterns inside the HTML.
         We try multiple patterns and return the first match.
         """
 
-        for pattern in (_PROFILE_PAGE_ID_RE, _LOGGING_PAGE_ID_RE, _USER_ID_RE, _PK_RE):
+        for pattern in (
+            _META_OWNER_ID_RE,
+            _META_AL_IOS_RE,
+            _META_AL_ANDROID_RE,
+            _PROFILE_PAGE_ID_RE,
+            _LOGGING_PAGE_ID_RE,
+            _USER_ID_RE,
+            _PK_RE,
+            _TARGET_ID_RE,
+            _OWNER_ID_JSON_RE,
+        ):
             match = pattern.search(html)
             if match:
                 value = match.group(1)
@@ -427,7 +446,7 @@ class InstagramClient:
     def _resolve_user_id(self, username: str) -> str:
         """Resolve an Instagram username to a numeric user ID.
 
-        1. Return cached value if available.
+        1. Return cached value from memory or persistent DB if available.
         2. Fetch the public profile HTML and extract the ID from embedded JSON.
         3. If the HTML does not expose the ID, call the web_profile_info API.
 
@@ -440,12 +459,26 @@ class InstagramClient:
         if cached:
             return cached
 
+        if self._get_user_id_fn:
+            try:
+                db_cached = self._get_user_id_fn(username)
+                if db_cached:
+                    self._user_id_cache[username] = db_cached
+                    return db_cached
+            except Exception as exc:
+                log.warning("Failed to fetch user ID from DB cache for @%s: %s", username, exc)
+
         # --- Step 1: try to extract from the public profile HTML ---
         try:
             html = self._get_profile_page(username)
             user_id = self._extract_user_id_from_html(html)
             if user_id:
                 self._user_id_cache[username] = user_id
+                if self._save_user_id_fn:
+                    try:
+                        self._save_user_id_fn(username, user_id)
+                    except Exception as exc:
+                        log.warning("Failed to save user ID to DB for @%s: %s", username, exc)
                 log.debug("Resolved @%s -> %s from profile HTML", username, user_id)
                 return user_id
         except InstagramHTTPError:
@@ -489,6 +522,11 @@ class InstagramClient:
             ) from exc
 
         self._user_id_cache[username] = user_id
+        if self._save_user_id_fn:
+            try:
+                self._save_user_id_fn(username, user_id)
+            except Exception as exc:
+                log.warning("Failed to save user ID to DB for @%s: %s", username, exc)
         log.debug("Resolved @%s -> %s from web_profile_info", username, user_id)
         return user_id
 
@@ -699,6 +737,8 @@ class InstagramClient:
         Fallback:       public profile HTML scraping.
         """
 
+        api_rate_limited: InstagramRateLimited | None = None
+
         # --- Primary: API v1 feed ---
         try:
             user_id = self._resolve_user_id(username)
@@ -706,8 +746,9 @@ class InstagramClient:
             if posts:
                 return posts
             log.info("API v1 feed returned no items for @%s; trying HTML.", username)
-        except InstagramRateLimited:
-            raise  # let the monitor handle 429
+        except InstagramRateLimited as exc:
+            log.info("API v1 path rate limited for @%s: %s; trying HTML fallback.", username, exc)
+            api_rate_limited = exc
         except InstagramHTTPError as exc:
             log.info(
                 "API v1 feed unavailable for @%s (%s); trying HTML.",
@@ -733,6 +774,9 @@ class InstagramClient:
                     username,
                     exc,
                 )
+
+        if api_rate_limited:
+            raise api_rate_limited
 
         raise InstagramHTTPError(
             f"All fetch methods failed for @{username}",
@@ -1202,9 +1246,7 @@ class InstagramClient:
     def _download_public_post(self, post: PublicPost, username: str) -> DownloadedPost:
         """Download a public-page post, falling back to Instaloader if needed."""
 
-        if post.is_carousel or not post.media_urls:
-            # Carousels need every child media item, which Instaloader exposes
-            # reliably while the public page does not.
+        if not post.media_urls:
             return self._download_with_instaloader_shortcode(post, username)
 
         target_dir = self.downloads_dir / username / post.shortcode
