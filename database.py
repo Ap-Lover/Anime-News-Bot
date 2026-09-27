@@ -36,6 +36,7 @@ class Database:
             maxPoolSize=8,
             minPoolSize=0,
             retryWrites=True,
+            tz_aware=True,
         )
 
         # Fail quickly at startup instead of discovering a broken database later.
@@ -243,6 +244,9 @@ class Database:
             was_rate_limit = previous_error and any(k in previous_error for k in rate_limit_keywords)
             if not (is_rate_limit and was_rate_limit):
                 return True
+
+        if last_alert and last_alert.tzinfo is None:
+            last_alert = last_alert.replace(tzinfo=UTC)
 
         return not last_alert or (
             now - last_alert
