@@ -41,6 +41,8 @@ instagram = InstagramClient(
     proxy_enabled=settings.proxy_enabled,
     proxy_url=settings.proxy_url,
     proxy_fallback_url=settings.proxy_fallback_url,
+    get_user_id_fn=db.get_user_id,
+    save_user_id_fn=db.save_user_id,
 )
 bot = Bot(settings.bot_token)
 dispatcher = Dispatcher()
