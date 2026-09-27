@@ -6,11 +6,9 @@ access is needed.
 
 from __future__ import annotations
 
-import json
-import sys
+import os
 import unittest
 from datetime import UTC, datetime
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 # ---------------------------------------------------------------------------
@@ -22,12 +20,10 @@ _ENV_DEFAULTS = {
     "DATABASE_URL": "mongodb://localhost/test",
 }
 
-import os
-
 for key, value in _ENV_DEFAULTS.items():
     os.environ.setdefault(key, value)
 
-from instagram import (
+from instagram import (  # noqa: E402
     InstagramClient,
     InstagramHTTPError,
     InstagramRateLimited,
@@ -263,6 +259,16 @@ class TestExtractUserIdFromHtml(unittest.TestCase):
         html = '<script>"profilePage_123"</script>'
         self.assertIsNone(InstagramClient._extract_user_id_from_html(html))
 
+    def test_extracts_from_meta_tags(self):
+        html_instapp = '<meta property="instapp:owner_id" content="1234567890" />'
+        self.assertEqual(InstagramClient._extract_user_id_from_html(html_instapp), "1234567890")
+
+        html_ios = '<meta property="al:ios:url" content="instagram://user?username=test&amp;id=9876543210" />'
+        self.assertEqual(InstagramClient._extract_user_id_from_html(html_ios), "9876543210")
+
+        html_android = '<meta property="al:android:url" content="https://instagram.com/_u/test/?id=1122334455" />'
+        self.assertEqual(InstagramClient._extract_user_id_from_html(html_android), "1122334455")
+
 
 class TestResolveUserId(unittest.TestCase):
     """Test _resolve_user_id with mocked HTTP."""
@@ -323,6 +329,16 @@ class TestResolveUserId(unittest.TestCase):
              patch.object(client, "_get_api_session", return_value=api_session):
             with self.assertRaises(InstagramRateLimited):
                 client._resolve_user_id("testuser")
+
+    def test_db_cached_user_id(self):
+        mock_get = MagicMock(return_value="5555555555")
+        mock_save = MagicMock()
+        client = _make_client(get_user_id_fn=mock_get, save_user_id_fn=mock_save)
+
+        user_id = client._resolve_user_id("sastaotaku")
+        self.assertEqual(user_id, "5555555555")
+        mock_get.assert_called_once_with("sastaotaku")
+        mock_save.assert_not_called()
 
 
 class TestFetchApiV1Feed(unittest.TestCase):
@@ -432,15 +448,56 @@ class TestLatestPosts(unittest.TestCase):
         self.assertEqual(len(posts), 1)
         self.assertEqual(posts[0].shortcode, "H1")
 
-    def test_rate_limit_propagates(self):
+    def test_rate_limit_falls_back_to_html(self):
         client = _make_client()
 
         with patch.object(
                 client, "_resolve_user_id",
                 side_effect=InstagramRateLimited("429"),
+             ), \
+             patch.object(client, "fetch_public_posts") as mock_html:
+            mock_html.return_value = [
+                PublicPost(shortcode="HTML1", media_urls=["https://example.com/1.jpg"])
+            ]
+            posts = client.latest_posts("testuser", limit=5)
+
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(posts[0].shortcode, "HTML1")
+
+    def test_rate_limit_propagates_if_html_fails(self):
+        client = _make_client()
+
+        with patch.object(
+                client, "_resolve_user_id",
+                side_effect=InstagramRateLimited("429"),
+             ), \
+             patch.object(
+                 client, "fetch_public_posts",
+                 side_effect=InstagramHTTPError("HTML failed", transient=True),
              ):
             with self.assertRaises(InstagramRateLimited):
                 client.latest_posts("testuser", limit=5)
+
+
+class TestDownloadPublicPostCarousel(unittest.TestCase):
+    """Test _download_public_post for carousel items with media_urls."""
+
+    def test_carousel_downloads_via_media_urls(self):
+        client = _make_client()
+        post = PublicPost(
+            shortcode="CxCarousel789",
+            is_carousel=True,
+            media_urls=["https://example.com/c1.jpg", "https://example.com/c2.jpg"],
+        )
+
+        with patch.object(client, "_download_media_urls") as mock_dl, \
+             patch.object(client, "_download_with_instaloader_shortcode") as mock_il:
+            mock_dl.return_value = [client.downloads_dir / "testuser" / "CxCarousel789" / "CxCarousel789_01.jpg"]
+            dl_post = client._download_public_post(post, "testuser")
+
+            mock_dl.assert_called_once()
+            mock_il.assert_not_called()
+            self.assertEqual(dl_post.shortcode, "CxCarousel789")
 
 
 class TestIterPosts(unittest.TestCase):
@@ -501,8 +558,6 @@ class TestNoInstaLoaderSessionInjection(unittest.TestCase):
 
     def test_loader_session_is_standard_requests(self):
         """Instaloader must use a plain requests.Session, not curl_cffi."""
-
-        import requests as std_requests
 
         client = _make_client()
         loader_session = client.loader.context._session
