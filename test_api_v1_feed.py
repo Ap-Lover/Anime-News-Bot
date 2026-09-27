@@ -499,6 +499,32 @@ class TestDownloadPublicPostCarousel(unittest.TestCase):
             mock_il.assert_not_called()
             self.assertEqual(dl_post.shortcode, "CxCarousel789")
 
+    def test_download_media_urls_without_context_manager(self):
+        """Test _download_media_urls with a Response object without __enter__/__exit__ (e.g. curl_cffi)."""
+        client = _make_client()
+        post = PublicPost(
+            shortcode="CxMedia123",
+            media_urls=["https://example.com/item.jpg"],
+        )
+
+        mock_resp = MagicMock(spec=["status_code", "headers", "iter_content", "close"])
+        mock_resp.status_code = 200
+        mock_resp.headers = {"Content-Type": "image/jpeg"}
+        mock_resp.iter_content.return_value = [b"fake_image_bytes"]
+
+        target_dir = client.downloads_dir / "testuser" / "CxMedia123"
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            with patch.object(client.session, "get", return_value=mock_resp):
+                files = client._download_media_urls(post, target_dir)
+
+            self.assertEqual(len(files), 1)
+            mock_resp.close.assert_called_once()
+        finally:
+            import shutil
+            shutil.rmtree(target_dir.parent, ignore_errors=True)
+
 
 class TestIterPosts(unittest.TestCase):
     """Test iter_posts() yields newest -> oldest via API v1."""
