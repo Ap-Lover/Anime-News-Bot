@@ -626,5 +626,41 @@ class TestGetApiSession(unittest.TestCase):
         self.assertIs(s1, s2)
 
 
+class TestShouldAlertError(unittest.TestCase):
+    """Test Database.should_alert_error timezone awareness and rate-limit suppression."""
+
+    def test_should_alert_error_handles_naive_and_aware_datetimes(self):
+        from unittest.mock import MagicMock
+
+        from database import Database
+
+        with patch("database.MongoClient") as mock_mc:
+            mock_client = MagicMock()
+            mock_mc.return_value = mock_client
+            mock_client.admin.command.return_value = True
+
+            db = Database("mongodb://localhost/test", "testdb")
+
+            # Mock feed document with naive datetime in last_alert_at
+            feed_doc = {
+                "username": "sastaotaku",
+                "chat_id": -1004451121423,
+                "last_error_alert": "InstagramRateLimited: Rate limited",
+                "last_alert_at": datetime.now(),  # naive
+            }
+
+            db.feeds = MagicMock()
+            db.feeds.find_one.return_value = feed_doc
+
+            # Should not raise TypeError when subtracting naive and aware datetimes
+            should_alert = db.should_alert_error(
+                "sastaotaku",
+                -1004451121423,
+                "InstagramRateLimited: Rate limited again",
+                cooldown_seconds=3600,
+            )
+            self.assertFalse(should_alert)
+
+
 if __name__ == "__main__":
     unittest.main()
