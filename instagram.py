@@ -1299,7 +1299,7 @@ class InstagramClient:
                     ) from exc
                 raise
 
-            with response:
+            try:
                 if response.status_code == 429:
                     raise InstagramRateLimited(
                         "Instagram rate limited a public media download."
@@ -1322,6 +1322,11 @@ class InstagramClient:
                     for chunk in response.iter_content(chunk_size=1024 * 256):
                         if chunk:
                             handle.write(chunk)
+            finally:
+                try:
+                    response.close()
+                except Exception:
+                    pass
 
             if path.stat().st_size == 0:
                 path.unlink(missing_ok=True)
